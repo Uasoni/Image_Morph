@@ -4,6 +4,10 @@
 
 Inspired by [this project](https://github.com/Spu7Nix/obamify).
 
+## Demonstration
+
+![A sample program output](/res/animation.gif)
+
 ## Directory
 
 | Type | Folder | Contents |
