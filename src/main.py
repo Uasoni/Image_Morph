@@ -2,16 +2,14 @@ import math
 import numpy as np
 from PIL import Image
 from get_images import read_all_files
-from transport import compute_matrix, sinkhorn_transport, topk_greedy_transport, sim_anneal_transport
 from utils import get_coords
 import subprocess
 
 def render_animation(assignment, result_pixels, width, num_steps=50):
-    # each pixel in the result image moves to its assigned target pixel
     frames = []
     UPSCALE = 4
     for i in range(10):
-        frames.append(result_pixels.reshape((width, width, 3)).repeat(UPSCALE, axis=0).repeat(UPSCALE, axis=1)) # initial frame (upscaled)
+        frames.append(result_pixels.reshape((width, width, 3)).repeat(UPSCALE, axis=0).repeat(UPSCALE, axis=1))
         
     final_frame = np.zeros((width * UPSCALE, width * UPSCALE, 3), dtype=np.uint8)
     for step in range(1, num_steps + 1):
@@ -21,11 +19,9 @@ def render_animation(assignment, result_pixels, width, num_steps=50):
             target_x, target_y = get_coords(target_idx, width)
             result_x, result_y = get_coords(i, width)
 
-            # Linear interpolation between result pixel and target pixel (with subpixel accuracy)
             interp_x = result_x + (target_x - result_x) * step / num_steps
             interp_y = result_y + (target_y - result_y) * step / num_steps
 
-            # Draw the pixel as a small square in the intermediate image
             x_start = int(interp_x * UPSCALE)
             y_start = int(interp_y * UPSCALE)
             intermediate_image[y_start:y_start+UPSCALE, x_start:x_start+UPSCALE] = result_pixels[i]
@@ -48,6 +44,7 @@ def compute_hard_image(assignment, result_pixels, width):
 
 def send_to_cpp(target_pixels, result_pixels, weight_pixels):
     width = int(math.sqrt(target_pixels.shape[0]))
+    
     with open("../data/transport_input.txt", "w") as f:
         f.write(f"{width}\n")
         for pixel in target_pixels:
@@ -56,29 +53,18 @@ def send_to_cpp(target_pixels, result_pixels, weight_pixels):
             f.write(f"{pixel[0]} {pixel[1]} {pixel[2]}\n")
         for weight in weight_pixels:
             f.write(f"{weight}\n")
-    # call c++ executable
+    
     subprocess.run(["../bin/transport"], check=True)
-    # read output assignment transport_output.txt
+
     assignment = []
     with open("../data/transport_output.txt", "r") as f:
         line = f.readline().strip()
         assignment = list(map(int, line.split()))
     return assignment
 
-
 def main():
     use_weights = input("Use weights? (y/n): ").strip().lower() == 'y'
     target_pixels, weight_pixels, result_pixels = read_all_files(use_weights=use_weights)
-
-    # print("Computing cost matrix...")
-    # matrix = compute_matrix(target_pixels, weight_pixels, result_pixels)
-    # print("Cost matrix computed.")
-
-    # transport = sinkhorn_transport(matrix, result_pixels, int(math.sqrt(target_pixels.shape[0])), verbose=True)
-    # transport = topk_greedy_transport(matrix, result_pixels, int(math.sqrt(target_pixels.shape[0])), K=128, refine_iters=1000000, verbose=True)
-    # transport = sim_anneal_transport(matrix, result_pixels, int(math.sqrt(target_pixels.shape[0])), iters=1000000, verbose=True)
-    # assignment = transport["assignment"]
-    # image = transport["hard_image"]
 
     assignment = send_to_cpp(target_pixels, result_pixels, weight_pixels)
     image = compute_hard_image(assignment, result_pixels, int(math.sqrt(target_pixels.shape[0])))

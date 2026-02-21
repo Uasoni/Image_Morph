@@ -128,15 +128,12 @@ class Cropper:
           - has width = k * base_w, height = k * base_h for some integer k >= 1
         Then convert to canvas coords and draw.
         """
-        # maximum k allowed by original image bounds
         max_k_w = self.ow // self.base_w
         max_k_h = self.oh // self.base_h
         max_k = min(max_k_w, max_k_h)
         if max_k < 1:
             max_k = 1
 
-        # choose k so resulting canvas area is reasonably large but not exceeding display
-        # we'll pick largest k that fits in original; that gives largest rectangle
         k = max_k
 
         rect_w_px, rect_h_px = self.units_to_pixels(k)
@@ -218,12 +215,10 @@ class Cropper:
         # clamp in original pixel space so rectangle stays fully inside
         rect_w_px = int(round(width_c / self.scale))
         rect_h_px = int(round(height_c / self.scale))
-        # ensure rect dims are multiples of base unit (they should be by construction)
-        # but if rounding produced off-by-one, adjust:
-        # compute k based on current rect size in px (rounded)
+        
         k_w = max(1, rect_w_px // self.base_w)
         k_h = max(1, rect_h_px // self.base_h)
-        # choose k that keeps aspect exact (they should be equal, but pick min)
+
         k = min(k_w, k_h)
         rect_w_px = k * self.base_w
         rect_h_px = k * self.base_h
