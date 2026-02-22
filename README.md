@@ -6,7 +6,7 @@ Inspired by [this project](https://github.com/Spu7Nix/obamify).
 
 ## Demonstration
 
-![A sample program output](/res/animation.gif)
+![Sample program output](/res/demo_anim.gif)
 
 ## Directory
 
