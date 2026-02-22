@@ -6,115 +6,79 @@ from tkinter import filedialog
 from cropper import Cropper
 from utils import get_aspect_ratio
 
-def load_target(path="target.png"):
-    """
-    Loads the target image from the given path.
-    Returns a dictionary with width, height, image, and RGB pixel data.
-    """
+def load_static(path, color_mode):
     if not os.path.exists(path):
-        raise FileNotFoundError(f"target image not found at '{path}'")
-    img = Image.open(path).convert("RGBA")
+        raise FileNotFoundError(f"File '{path}' not found.")
+    img = Image.open(path).convert(color_mode)
     w, h = img.size
-
-    rgb = img.convert("RGB")
-    pixels = np.array(rgb).reshape(-1, 3) # list of (R,G,B) tuples
+    pixels = np.array(img).reshape(-1, 3) if color_mode == "RGB" else np.array(img).reshape(-1)
 
     return {"width": w, "height": h, "image": img, "pixels": pixels}
 
-def load_weights(path="weights.png"):
-    """
-    Loads the weight map from the given path.
-    Returns a dictionary with width, height, image, and weight data.
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"weight map not found at '{path}'")
-    img = Image.open(path).convert("L")
-    w, h = img.size
-
-    weights = np.array(img).reshape(-1) # list of weights
-    weights = weights.astype(np.float32) / 255.0 # normalize to [0,1]
-    return {"width": w, "height": h, "image": img, "pixels": weights}
-
-def pick_file_via_dialog():
+def open_file_dialog():
     root = tk.Tk()
     root.withdraw()
     filetypes = [("Image files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")]
-    path = filedialog.askopenfilename(title="Select an image to upload", filetypes=filetypes)
+    path = filedialog.askopenfilename(title="Select an image to upload", filetypes=filetypes, initialdir="../img")
     root.destroy()
     return path
 
-def load_uploaded(upload_path, target_w, target_h, target_aspect):
-    """
-    Loads and crops/resizes the uploaded image to match target dimensions.
-    Returns a dictionary with the resized image and its RGB pixel data.
-    """
-    src = Image.open(upload_path).convert("RGB")
-
-    cropper = Cropper(src, target_w, target_h)
+def load_user_image(w, h, aspect):
+    path = open_file_dialog()
+    if not path:
+        raise ValueError("No image selected.")
+    raw_img = Image.open(path).convert("RGB")
+    
+    cropper = Cropper(raw_img, w, h)
     accepted, crop_box = cropper.run()
     if not accepted:
         raise RuntimeError("User canceled cropping or closed the window.")
     left, top, right, bottom = crop_box
-    cropped = src.crop((left, top, right, bottom))
+    img = raw_img.crop((left, top, right, bottom))
 
-    cw, ch = cropped.size
+    cw, ch = img.size
 
-    if cw >= target_w and ch >= target_h:
-        resample = Image.Resampling.LANCZOS
-    else:
-        resample = Image.Resampling.NEAREST
+    res_algo = Image.Resampling.LANCZOS if (cw >= w and ch >= h) else Image.Resampling.NEAREST
+    img = img.resize((w, h), res_algo)
+    pixels = np.array(img).reshape(-1, 3)
 
-    img = cropped.resize((target_w, target_h), resample=resample)
+    return {"width": w, "height": h, "image": img, "pixels": pixels}
 
-    pixels = np.array(img).reshape(-1, 3) # list of (R,G,B) tuples
-    return {"image": img, "pixels": pixels}
-
-def read_all_files(use_weights=True):
-    print("Loading target.png...")
+def read_all_files(use_weights=False):
+    # Load /data/target.png
+    print("Loading /data/target.png...")
     try:
-        target = load_target("../data/target.png")
+        target_data = load_static("../data/target.png", "RGB")
     except Exception as e:
-        print("Error loading target.png:", e)
-        return
-    
+        raise RuntimeError(f"Error loading /data/target.png: {e}")
+    w, h = target_data["width"], target_data["height"]
+    aspect = get_aspect_ratio(w, h)
+    print("Target image loaded with dimensions", w, "x", h)
+
+    # Load /data/weights.png if weights enabled
     if use_weights:
-        print("Loading weights.png...")
+        print("Loading /data/weights.png...")
         try:
-            weights = load_weights("../data/weights.png")
+            weight_data = load_static("../data/weights.png", "L")
         except Exception as e:
-            print("Error loading weights.png:", e)
-            return
+            raise RuntimeError(f"Error loading /data/weights.png: {e}")
+        if weight_data["width"] != w or weight_data["height"] != h:
+            raise ValueError("weights.png dimensions do not match target.png")
     else:
-        weights = {"pixels": np.ones_like(target["pixels"][:,0])} # dummy weights
+        weight_data = {"width": w, "height": h, "image": Image.new("L", (w, h), color=255), "pixels": 255 * np.ones(w * h, dtype=np.float32)}
 
-    target_w = target["width"]
-    target_h = target["height"]
-    target_pixels = target["pixels"]
-
-    weight_pixels = weights["pixels"]
-    if weight_pixels.shape[0] != target_pixels.shape[0]:
-        print("Warning: weight map size does not match target image size. Ignoring weights.")
-        weight_pixels = np.ones_like(target_pixels[:,0])
-
-    print(f"Target image: {target_w} x {target_h}")
-    print("Please select an image file to upload in the dialog.")
-    upload_path = pick_file_via_dialog()
-    if not upload_path:
-        print("No file selected. Exiting.")
-        return
-
-    print("Processing uploaded image:", upload_path)
-    target_aspect = get_aspect_ratio(target_w, target_h)
+    if weight_data['width'] != w or weight_data['height'] != h:
+        raise ValueError("weights.png dimensions do not match target.png")
+    weight_data["pixels"] /= 255.0 # normalize weights to [0,1]
+    
+    # Load user provided image (initial image)
     try:
-        result = load_uploaded(upload_path, target_w, target_h, target_aspect)
-        resized_img = result["image"]
-        result_pixels = result["pixels"]
+        user_data = load_user_image(w, h, aspect)
     except Exception as e:
-        print("Operation canceled or failed:", e)
-        return
+        raise RuntimeError(f"Error loading user image: {e}")
     
     out_path = "../res/resized_result.png"
-    resized_img.save(out_path)
-    print(f"Note: resized image saved to {out_path}")
+    user_data["image"].save(out_path)
+    print(f"Resized user image saved to {out_path}")
 
-    return target_pixels, weight_pixels, result_pixels
+    return target_data["pixels"], weight_data["pixels"], user_data["pixels"]

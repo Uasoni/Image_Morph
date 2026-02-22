@@ -1,47 +1,81 @@
 import math
-import tkinter as tk
 from PIL import Image, ImageTk
+import tkinter as tk
+from utils import get_aspect_ratio
 
 class Cropper:
+    TARGET_DISPLAY_AREA = 1000 * 1000
+    MIN_SCALE = 0.05
+    MAX_SCALE = 8.0
+
     HANDLE_SIZE = 10
-    MIN_UNITS = 1   # minimum size is 1 base unit (k >= 1)
 
-    def __init__(self, pil_image, target_w, target_h, max_display_size=(1000,800), target_display_area=1000_000):
-        self.orig_image = pil_image
-        self.ow, self.oh = pil_image.size
-        if self.ow <= 0 or self.oh <= 0:
-            raise ValueError("Original image has invalid size")
-        self.target_w = int(target_w)
-        self.target_h = int(target_h)
-        self.max_display_size = max_display_size
-        self.TARGET_DISPLAY_AREA = target_display_area
+    def _canvas_to_px(self, x, y):
+        return int(x / self.display_scale), int(y / self.display_scale)
+    
+    def _px_to_canvas(self, x, y):
+        return float(x * self.display_scale), float(y * self.display_scale)
+    
+    def _unit_to_px(self, k):
+        return int(k * self.base_dim[0]), int(k * self.base_dim[1])
+    
+    def _is_inside_crop_box(self, x, y):
+        x1, y1, x2, y2 = self.canvas.coords(self.crop_box)
+        return x1 < x < x2 and y1 < y < y2
+    
+    def _get_handle_hit(self, x, y):
+        for i, handle in enumerate(self.handles):
+            hx1, hy1, hx2, hy2 = self.canvas.coords(handle)
+            if hx1 < x < hx2 and hy1 < y < hy2:
+                return i
+        return None
 
-        # compute exact aspect and base unit in original pixels
-        g = math.gcd(self.target_w, self.target_h)
-        self.base_w = self.target_w // g
-        self.base_h = self.target_h // g
-        # aspect as float for some calculations
-        self.aspect = self.target_w / self.target_h
+    def __init__(self, raw_img, w, h):
+        self.raw_img = raw_img
+        self.raw_dim = raw_img.size
+        self.target_dim = (w, h)
 
-        # UI and internal state
-        self.crop_box_original = None
-        self._accepted = False
+        # Compute aspect ratio and base unit (for regularised scaling)
+        self.aspect = get_aspect_ratio(self.target_dim[0], self.target_dim[1])
+        wh_gcd = math.gcd(self.target_dim[0], self.target_dim[1])
+        self.base_dim = (self.target_dim[0] // wh_gcd, self.target_dim[1] // wh_gcd)
 
-        # build UI
+        # UI and state variables
+        self.mode = None # "move" or "resize" (or None)
+        self.active_handle = None # 0: TL, 1: TR, 2: BL, 3: BR
+        self.init_mouse_pos = (0,0)
+        self.init_rect = None
+        self.accepted = False
+        self.final_crop_box = None
+
+        self.build_ui()
+
+    def _get_display(self):
+        scale = (self.TARGET_DISPLAY_AREA / (self.raw_dim[0] * self.raw_dim[1])) ** 0.5
+        scale = max(self.MIN_SCALE, min(self.MAX_SCALE, scale))
+
+        display_dim = (int(self.raw_dim[0] * scale), int(self.raw_dim[1] * scale))
+        res_algo = Image.Resampling.LANCZOS if scale < 1.0 else Image.Resampling.NEAREST
+
+        display_img = self.raw_img.resize(display_dim, res_algo)
+        return {"width": display_dim[0], "height": display_dim[1], "img": display_img, "scale": scale}
+    
+    def build_ui(self):
         self.root = tk.Tk()
         self.root.title("Crop Image")
-        tk.Label(self.root, text="Drag corners to resize; Drag inside box to move").pack(anchor="w")
+        
+        display_data = self._get_display()
+        self.display_img = display_data["img"]
+        self.display_scale = display_data["scale"]
+        self.display_dim = (display_data["width"], display_data["height"])
 
-        self.display_image, self.scale = self._scaled_display_image()
-        self.w, self.h = self.display_image.size
-
-        self.canvas = tk.Canvas(self.root, width=self.w, height=self.h, cursor="cross")
+        self.canvas = tk.Canvas(self.root, width=display_data["width"], height=display_data["height"], cursor="cross")
         self.canvas.pack()
 
-        self.tkimg = ImageTk.PhotoImage(self.display_image)
-        self.canvas.create_image(0, 0, anchor="nw", image=self.tkimg)
+        self.tk_img = ImageTk.PhotoImage(self.display_img)
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_img)
 
-        self.overlay_parts = [
+        self.overlays = [ # For shading non-crop area
             self.canvas.create_rectangle(0, 0, 0, 0, fill="black", stipple="gray50", width=0),
             self.canvas.create_rectangle(0, 0, 0, 0, fill="black", stipple="gray50", width=0),
             self.canvas.create_rectangle(0, 0, 0, 0, fill="black", stipple="gray50", width=0),
@@ -49,269 +83,145 @@ class Cropper:
         ]
 
         btn_frame = tk.Frame(self.root)
-        btn_frame.pack(fill="x", pady=6)
-        tk.Button(btn_frame, text="Accept", command=self._on_accept).pack(side="right", padx=6)
-        tk.Button(btn_frame, text="Cancel", command=self._on_cancel).pack(side="right")
+        btn_frame.pack(fill=tk.X, pady=6)
+        tk.Button(btn_frame, text="Accept", command=self.on_accept).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="Cancel", command=self.on_cancel).pack(side=tk.RIGHT)
 
-        # initial rectangle (largest centered, in original pixels then converted to canvas)
-        self._create_initial_rect()
+        self.canvas.bind("<ButtonPress-1>", self.press)
+        self.canvas.bind("<B1-Motion>", self.drag)
+        self.canvas.bind("<ButtonRelease-1>", self.release)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_cancel)
 
-        # interaction state
-        self.mode = None            # "move" or "resize" or None
-        self.active_corner = None   # 0:TL,1:TR,2:BL,3:BR
-        self.start_mouse = (0,0)
-        self.start_rect = None     # canvas coords at drag start
+        self.init_crop_box()
 
-        # bind events
-        self.canvas.bind("<ButtonPress-1>", self._press)
-        self.canvas.bind("<B1-Motion>", self._drag)
-        self.canvas.bind("<ButtonRelease-1>", self._release)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_cancel)
-        
-    def _scaled_display_image(self):
-        """
-        Scale image so its displayed area is ~ TARGET_DISPLAY_AREA (canvas pixels).
-        Choose NEAREST when scaling up (big pixels), LANCZOS when scaling down.
-        Return (display_image, scale) where scale = display_pixels_per_original_pixel.
-        """
-        ow, oh = self.orig_image.size
-        max_w, max_h = self.max_display_size
+    def init_crop_box(self):
+        k = max(1, min(self.raw_dim[0] // self.base_dim[0], self.raw_dim[1] // self.base_dim[1]))
+        rect_w, rect_h = self._unit_to_px(k)
 
-        scale = (self.TARGET_DISPLAY_AREA / (ow * oh)) ** 0.5
-        MIN_SCALE = 0.05
-        MAX_SCALE = 8.0
-        scale = max(MIN_SCALE, min(MAX_SCALE, scale))
+        left = (self.raw_dim[0] - rect_w) // 2
+        top = (self.raw_dim[1] - rect_h) // 2
+        right = left + rect_w
+        bottom = top + rect_h
 
-        disp_w = max(1, int(round(ow * scale)))
-        disp_h = max(1, int(round(oh * scale)))
-
-        # ensure fits window
-        fit_scale_x = max_w / disp_w if disp_w > 0 else 1.0
-        fit_scale_y = max_h / disp_h if disp_h > 0 else 1.0
-        fit_scale = min(1.0, fit_scale_x, fit_scale_y)
-        if fit_scale < 1.0:
-            disp_w = int(round(disp_w * fit_scale))
-            disp_h = int(round(disp_h * fit_scale))
-            scale *= fit_scale
-
-        # choose resampling
-        if scale >= 1.0:
-            resample = Image.Resampling.NEAREST
-        else:
-            resample = Image.Resampling.LANCZOS
-
-        disp_img = self.orig_image.resize((disp_w, disp_h), resample=resample)
-        return disp_img, scale
-
-    def canvas_to_img_px(self, cx, cy):
-        """Convert canvas (display) coords to nearest original-image pixel coordinates (integers)."""
-        # inverse scale: original_pixel = canvas_coord / scale
-        px = int(round(cx / self.scale))
-        py = int(round(cy / self.scale))
-        # clamp
-        px = max(0, min(self.ow - 1, px))
-        py = max(0, min(self.oh - 1, py))
-        return px, py
-
-    def img_px_to_canvas(self, px, py):
-        """Convert original-image integer pixel coords to canvas coords (float)."""
-        return float(px * self.scale), float(py * self.scale)
-
-    def units_to_pixels(self, k):
-        """Width and height in original pixels for k base-units."""
-        return k * self.base_w, k * self.base_h
-
-    def _create_initial_rect(self):
-        """
-        Choose the largest possible centered rectangle in original-image pixels that:
-          - fits in (original_w, original_h),
-          - has width = k * base_w, height = k * base_h for some integer k >= 1
-        Then convert to canvas coords and draw.
-        """
-        max_k_w = self.ow // self.base_w
-        max_k_h = self.oh // self.base_h
-        max_k = min(max_k_w, max_k_h)
-        if max_k < 1:
-            max_k = 1
-
-        k = max_k
-
-        rect_w_px, rect_h_px = self.units_to_pixels(k)
-
-        # center in original-image pixel coordinates
-        left_px = (self.ow - rect_w_px) // 2
-        top_px = (self.oh - rect_h_px) // 2
-        right_px = left_px + rect_w_px
-        bottom_px = top_px + rect_h_px
-
-        # convert to canvas coordinates
-        left_c, top_c = self.img_px_to_canvas(left_px, top_px)
-        right_c, bottom_c = self.img_px_to_canvas(right_px, bottom_px)
-
-        self.rect = self.canvas.create_rectangle(left_c, top_c, right_c, bottom_c, outline="red", width=2)
+        left_c, top_c = self._px_to_canvas(left, top)
+        right_c, bottom_c = self._px_to_canvas(right, bottom)
+        self.crop_box = self.canvas.create_rectangle(left_c, top_c, right_c, bottom_c, outline="red", width=2)
         self.handles = []
-        self._draw_handles()
-        self._update_overlay()
+        self.draw_handles()
+        self.update_overlay()
 
-    def _draw_handles(self):
-        for h in getattr(self, "handles", []):
+    def draw_handles(self):
+        for handle in getattr(self, "handles", []):
             try:
-                self.canvas.delete(h)
+                self.canvas.delete(handle)
             except Exception:
                 pass
         self.handles = []
-        x1, y1, x2, y2 = self.canvas.coords(self.rect)
-        pts = [(x1,y1),(x2,y1),(x1,y2),(x2,y2)]
-        for px, py in pts:
-            h = self.canvas.create_rectangle(px - self.HANDLE_SIZE, py - self.HANDLE_SIZE,
-                                             px + self.HANDLE_SIZE, py + self.HANDLE_SIZE,
-                                             fill="white", outline="black")
-            self.handles.append(h)
+        x1, y1, x2, y2 = self.canvas.coords(self.crop_box)
+        for cx, cy in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
+            handle = self.canvas.create_rectangle(cx - self.HANDLE_SIZE, cy - self.HANDLE_SIZE,
+                                                  cx + self.HANDLE_SIZE, cy + self.HANDLE_SIZE,
+                                                  fill="white", outline="black")
+            self.handles.append(handle)
 
-    def _inside_rect(self, x, y):
-        x1,y1,x2,y2 = self.canvas.coords(self.rect)
-        return x1 < x < x2 and y1 < y < y2
+    def update_overlay(self):
+        x1, y1, x2, y2 = self.canvas.coords(self.crop_box)
+        w, h = self.display_dim
+        self.canvas.coords(self.overlays[0], 0, 0, w, y1) # top
+        self.canvas.coords(self.overlays[1], 0, y2, w, h) # bottom
+        self.canvas.coords(self.overlays[2], 0, y1, x1, y2) # left
+        self.canvas.coords(self.overlays[3], x2, y1, w, y2) # right
 
-    def _handle_hit(self, x, y):
-        for i, h in enumerate(self.handles):
-            x1,y1,x2,y2 = self.canvas.coords(h)
-            if x1 <= x <= x2 and y1 <= y <= y2:
-                return i
-        return None
-    
-    def _press(self, e):
-        self.start_mouse = (e.x, e.y)
-        self.start_rect = tuple(self.canvas.coords(self.rect))
-        handle = self._handle_hit(e.x, e.y)
-        if handle is not None:
+        for overlay in self.overlays:
+            self.canvas.tag_raise(overlay, self.crop_box)
+
+    def press(self, event):
+        self.init_mouse_pos = (event.x, event.y)
+        self.init_rect = tuple(self.canvas.coords(self.crop_box))
+        handle_hit = self._get_handle_hit(event.x, event.y)
+        if handle_hit is not None:
             self.mode = "resize"
-            self.active_corner = handle
-        elif self._inside_rect(e.x, e.y):
+            self.active_handle = handle_hit
+        elif self._is_inside_crop_box(event.x, event.y):
             self.mode = "move"
         else:
             self.mode = None
+            self.active_handle = None
 
-    def _drag(self, e):
+    def drag(self, event):
         if not self.mode:
             return
         if self.mode == "move":
-            self._perform_move(e)
-        else:
-            self._perform_resize(e)
+            self.move(event)
+        elif self.mode == "resize":
+            self.resize(event)
 
-    def _perform_move(self, e):
-        # start_rect are canvas coords
-        x1_c, y1_c, x2_c, y2_c = self.start_rect
-        width_c = x2_c - x1_c
-        height_c = y2_c - y1_c
-
-        # desired new top-left in canvas coords
-        nx1_c = x1_c + (e.x - self.start_mouse[0])
-        ny1_c = y1_c + (e.y - self.start_mouse[1])
-
-        # Convert to original-image pixel coords (snap)
-        nx1_px, ny1_px = self.canvas_to_img_px(nx1_c, ny1_c)
-
-        # clamp in original pixel space so rectangle stays fully inside
-        rect_w_px = int(round(width_c / self.scale))
-        rect_h_px = int(round(height_c / self.scale))
+    def move(self, event):
+        x1, y1, x2, y2 = self.init_rect
+        init_dim = (x2 - x1, y2 - y1)
         
-        k_w = max(1, rect_w_px // self.base_w)
-        k_h = max(1, rect_h_px // self.base_h)
+        nx1 = x1 + (event.x - self.init_mouse_pos[0])
+        ny1 = y1 + (event.y - self.init_mouse_pos[1])
 
-        k = min(k_w, k_h)
-        rect_w_px = k * self.base_w
-        rect_h_px = k * self.base_h
+        left, top = self._canvas_to_px(nx1, ny1)
 
-        nx1_px = max(0, min(nx1_px, self.ow - rect_w_px))
-        ny1_px = max(0, min(ny1_px, self.oh - rect_h_px))
+        crop_box_w = int(init_dim[0] / self.display_scale)
+        crop_box_h = int(init_dim[1] / self.display_scale)
 
-        # convert back to canvas coordinates and apply
-        nx1_c, ny1_c = self.img_px_to_canvas(nx1_px, ny1_px)
-        nx2_c, ny2_c = self.img_px_to_canvas(nx1_px + rect_w_px, ny1_px + rect_h_px)
+        k = max(1, min(crop_box_w // self.base_dim[0], crop_box_h // self.base_dim[1]))
+        crop_box_w = int(k * self.base_dim[0])
+        crop_box_h = int(k * self.base_dim[1])
 
-        self.canvas.coords(self.rect, nx1_c, ny1_c, nx2_c, ny2_c)
-        self._draw_handles()
-        self._update_overlay()
+        left = max(0, min(left, self.raw_dim[0] - crop_box_w))
+        top = max(0, min(top, self.raw_dim[1] - crop_box_h))
 
-    def _perform_resize(self, e):
-        # Work in original pixel coordinates for snapping and exact aspect preservation.
-        # start_rect is canvas coords; convert the fixed corner to original pixels.
-        x1_c, y1_c, x2_c, y2_c = self.start_rect
+        nx1, ny1 = self._px_to_canvas(left, top)
+        nx2, ny2 = self._px_to_canvas(left + crop_box_w, top + crop_box_h)
+        self.canvas.coords(self.crop_box, nx1, ny1, nx2, ny2)
+        self.draw_handles()
+        self.update_overlay()
 
-        # find fixed corner original pixel coords depending on active_corner
-        fixed_cx, fixed_cy = (x2_c, y2_c) if self.active_corner == 0 else ((x1_c, y2_c) if self.active_corner == 1 else ((x2_c, y1_c) if self.active_corner == 2 else (x1_c, y1_c)))
-        # mouse position maps to candidate opposite coordinate
-        mouse_px, mouse_py = self.canvas_to_img_px(e.x, e.y)
-        fixed_px, fixed_py = self.canvas_to_img_px(fixed_cx, fixed_cy)
-        # raw width in px (original)
-        raw_width = abs(fixed_px - mouse_px)
-        # compute k (units) from raw_width, round to nearest but not below 1
-        k = max(self.MIN_UNITS, int(round(raw_width / self.base_w)))
-        candidate_w_px, candidate_h_px = self.units_to_pixels(k)
-        left_px = fixed_px - candidate_w_px if self.active_corner in [0,2] else fixed_px
-        top_px = fixed_py - candidate_h_px if self.active_corner in [0,1] else fixed_py
-        right_px = fixed_px if self.active_corner in [0,2] else fixed_px + candidate_w_px
-        bottom_px = fixed_py if self.active_corner in [0,1] else fixed_py + candidate_h_px
+    def resize(self, event):
+        x1, y1, x2, y2 = self.init_rect
+        handle_idx = self.active_handle
+        fixed_corner = [(x2, y2), (x1, y2), (x2, y1), (x1, y1)][handle_idx]
 
-        # Strict check: must be fully inside original image bounds and be >= 1 unit
-        if left_px < 0 or top_px < 0 or right_px > self.ow or bottom_px > self.oh:
-            # ignore this resize candidate
+        mouse_pos = self._canvas_to_px(event.x, event.y)
+        fixed_pos = self._canvas_to_px(*fixed_corner)
+        raw_w = abs(mouse_pos[0] - fixed_pos[0])
+        k = max(1, int(raw_w / self.base_dim[0]))
+        crop_box_dim = self._unit_to_px(k)
+        if handle_idx in [0, 3]: # TL or BR
+            new_corner = (fixed_pos[0] + crop_box_dim[0], fixed_pos[1] + crop_box_dim[1])
+        else: # TR or BL
+            new_corner = (fixed_pos[0] - crop_box_dim[0], fixed_pos[1] + crop_box_dim[1])
+
+        if new_corner[0] < 0 or new_corner[1] < 0 or new_corner[0] > self.raw_dim[0] or new_corner[1] > self.raw_dim[1]:
             return
-        if (right_px - left_px) < self.base_w or (bottom_px - top_px) < self.base_h:
+        if crop_box_dim[0] < self.base_dim[0] or crop_box_dim[1] < self.base_dim[1]:
             return
 
-        # Convert candidate back to canvas coords and apply (these will snap because candidate was computed in px)
-        left_c, top_c = self.img_px_to_canvas(left_px, top_px)
-        right_c, bottom_c = self.img_px_to_canvas(right_px, bottom_px)
-        self.canvas.coords(self.rect, left_c, top_c, right_c, bottom_c)
-        self._draw_handles()
-        self._update_overlay()
-        
-    def _update_overlay(self):
-        """
-        Darken everything outside the crop rectangle using 4 stippled rectangles.
-        """
-        x1, y1, x2, y2 = self.canvas.coords(self.rect)
-        w, h = self.w, self.h
+        new_corner_c = self._px_to_canvas(*new_corner)
+        self.canvas.coords(self.crop_box, fixed_corner[0], fixed_corner[1], new_corner_c[0], new_corner_c[1])
+        self.draw_handles()
+        self.update_overlay()        
 
-        self.canvas.coords(self.overlay_parts[0], 0, 0, w, y1)
-        self.canvas.coords(self.overlay_parts[1], 0, y2, w, h)
-        self.canvas.coords(self.overlay_parts[2], 0, y1, x1, y2)
-        self.canvas.coords(self.overlay_parts[3], x2, y1, w, y2)
-
-        # ensure overlays sit above image but below handles/rect border
-        for r in self.overlay_parts:
-            self.canvas.tag_raise(r, self.rect)
-
-    def _release(self, e):
+    def release(self, event):
         self.mode = None
-        self.active_corner = None
+        self.active_handle = None
 
-    def _on_accept(self):
-        # Convert canvas coords to original image integer pixel coords and ensure integer bounds
-        x1_c, y1_c, x2_c, y2_c = self.canvas.coords(self.rect)
-        left_px, top_px = self.canvas_to_img_px(x1_c, y1_c)
-        right_px, bottom_px = self.canvas_to_img_px(x2_c, y2_c)
-        # Ensure left<right, top<bottom (and make right/bottom exclusive if you want)
-        if right_px <= left_px:
-            right_px = left_px + self.base_w
-        if bottom_px <= top_px:
-            bottom_px = top_px + self.base_h
-        # final clamp
-        left_px = max(0, min(self.ow - self.base_w, left_px))
-        top_px = max(0, min(self.oh - self.base_h, top_px))
-        right_px = max(left_px + self.base_w, min(self.ow, right_px))
-        bottom_px = max(top_px + self.base_h, min(self.oh, bottom_px))
-
-        self.crop_box_original = (int(left_px), int(top_px), int(right_px), int(bottom_px))
-        self._accepted = True
+    def on_accept(self):
+        x1, y1, x2, y2 = self.canvas.coords(self.crop_box)
+        left, top = self._canvas_to_px(x1, y1)
+        right, bottom = self._canvas_to_px(x2, y2)
+        self.final_crop_box = (left, top, right, bottom)
+        self.accepted = True
         self.root.destroy()
 
-    def _on_cancel(self):
-        self._accepted = False
+    def on_cancel(self):
+        self.accepted = False
         self.root.destroy()
 
     def run(self):
         self.root.mainloop()
-        return self._accepted, self.crop_box_original
+        return self.accepted, self.final_crop_box
