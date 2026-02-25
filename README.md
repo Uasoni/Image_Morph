@@ -1,5 +1,7 @@
 # Image Morph
 
+Rearranges the pixels of some provided image to try and most accurately match a target image (with minimal pixel movement). I would say this is some groundbreaking stuff but it's just pretty funny.
+
 ## Credits
 
 Inspired by [this project](https://github.com/Spu7Nix/obamify).
